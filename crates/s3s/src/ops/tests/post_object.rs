@@ -1113,3 +1113,85 @@ async fn post_object_declaration_as_a_header_is_treated_as_unsigned() {
         .expect("a header is not a signed carrier on a form upload");
     assert_eq!(err.code(), &crate::error::S3ErrorCode::AccessDenied);
 }
+
+/// AWS's POST form names the canned ACL `acl` and the tag set `tagging`, an XML `Tagging`
+/// document; a PUT carries the same two as the `x-amz-acl` and `x-amz-tagging` headers.
+#[tokio::test]
+async fn post_object_reads_the_acl_and_tagging_form_fields() {
+    use crate::auth::SecretKey;
+    use crate::dto::{PostObjectInput, PostObjectOutput};
+    use crate::http::{Body, Request};
+    use crate::{S3Request, S3Response, S3Result};
+    use bytes::Bytes;
+    use hyper::Method;
+    use post_policy_test_helpers::{build_multipart_fields, build_multipart_file_field};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct TestS3 {
+        seen: Mutex<Option<(Option<String>, Option<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::s3_trait::S3 for TestS3 {
+        async fn post_object(&self, req: S3Request<PostObjectInput>) -> S3Result<S3Response<PostObjectOutput>> {
+            let acl = req.input.acl.as_ref().map(|acl| acl.as_str().to_owned());
+            *self.seen.lock().unwrap() = Some((acl, req.input.tagging.clone()));
+            Ok(S3Response::new(PostObjectOutput::default()))
+        }
+    }
+
+    let test_s3 = Arc::new(TestS3::default());
+    let s3: Arc<dyn crate::s3_trait::S3> = test_s3.clone();
+    let config = post_policy_test_helpers::create_test_config(1024 * 1024);
+    let auth = post_policy_test_helpers::create_test_auth();
+    let ccx = post_policy_test_helpers::create_test_context(&s3, &config, &auth);
+    let secret_key: SecretKey = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into();
+
+    let tagging = "<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>";
+    let policy_json = format!(
+        r#"{{"expiration":"2030-01-01T00:00:00.000Z","conditions":[{},{{"acl":"public-read"}},["starts-with","$tagging",""]]}}"#,
+        post_policy_test_helpers::BASE_CONDITIONS,
+    );
+    let amz_date = s3s_sigv4::AmzDate::parse("20250101T000000Z").unwrap();
+    let amz_date_str = amz_date.fmt_iso8601();
+    let algorithm = "AWS4-HMAC-SHA256";
+    let credential = "AKIAIOSFODNN7EXAMPLE/20250101/us-east-1/s3/aws4_request";
+    let policy_json =
+        post_policy_test_helpers::augment_post_policy_for_test(&policy_json, amz_date_str.as_str(), credential, algorithm);
+    let policy_b64 = base64_simd::STANDARD.encode_to_string(&policy_json);
+    let signature = s3s_sigv4::calculate_signature(&policy_b64, secret_key.expose(), &amz_date, "us-east-1", "s3");
+
+    let boundary = "------------------------test12345678";
+    let fields = [
+        ("x-amz-signature", signature.as_str()),
+        ("bucket", "test-bucket"),
+        ("policy", policy_b64.as_str()),
+        ("x-amz-algorithm", algorithm),
+        ("x-amz-credential", credential),
+        ("x-amz-date", amz_date_str.as_str()),
+        ("key", "test-key"),
+        ("acl", "public-read"),
+        ("tagging", tagging),
+    ];
+    let body = build_multipart_fields(&fields, boundary)
+        + build_multipart_file_field("file", "test.txt", "text/plain", "hello", boundary).as_str();
+    let mut req = Request::from(
+        hyper::Request::builder()
+            .method(Method::POST)
+            .uri("http://localhost/test-bucket")
+            .header(crate::header::HOST, "localhost")
+            .header(
+                crate::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}")).unwrap(),
+            )
+            .header(hyper::header::CONTENT_LENGTH, body.len())
+            .body(Body::from(Bytes::from(body)))
+            .unwrap(),
+    );
+
+    let resp = super::call(&mut req, &ccx).await;
+    assert!(resp.is_ok(), "the form upload failed: {:?}", resp.err());
+    let seen = test_s3.seen.lock().unwrap().take();
+    assert_eq!(seen, Some((Some("public-read".to_owned()), Some("a=b".to_owned()))));
+}
